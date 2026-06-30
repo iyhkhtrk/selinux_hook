@@ -25,7 +25,7 @@
 #include <kputils.h>
 
 KPM_NAME("selinux_magisk_access_filter");
-KPM_VERSION("1.1.2-dirtysepolicy");
+KPM_VERSION("1.1.2");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
