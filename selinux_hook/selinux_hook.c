@@ -3609,14 +3609,14 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
 
     sample[0] = '\0';
     sample_len = value && size ? copy_query_sample(sample, (const char *)value, size) : 0;
+    uid = current_uid();
     /*
      * 4.9 setprocattr path / 4.9 setprocattr 路径：
      * avoid clean policydb helpers with device-specific ABI; only block known
      * DirtySepolicy probes while allowing manager/root callers through.
      */
     if (selinux_49_compat_path()) {
-        uid = current_uid();
-        manager = (uid < 10000) || current_is_policy_manager();
+        manager = should_bypass_clean_filter(uid);
         if (!manager && (dirtysepolicy_context_should_hide(sample) ||
                          legacy_should_block_access_query(sample, sample_len)))
             clean_ret = -EINVAL;
@@ -3631,7 +3631,7 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
         return blocked;
     }
 
-    manager = current_is_policy_manager();
+    manager = should_bypass_clean_filter(uid);
     if (!manager) {
         if (dirtysepolicy_context_should_hide(sample)) {
             clean_checked = true;
@@ -3653,7 +3653,6 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     }
     blocked = !manager && clean_ret == -EINVAL;
 
-    uid = current_uid();
     n = READ_ONCE(g_procattr_current_count) + 1;
     WRITE_ONCE(g_procattr_current_count, n);
 
