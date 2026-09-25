@@ -491,7 +491,6 @@ static bool clean_policydb_redirect_supported(void);
 static bool selinux_compat_call_needed(void);
 static bool security_setprocattr_has_lsm_arg(void);
 static void append_u32_dec(char *buf, size_t size, u32 value);
-static unsigned long lookup_name_with_suffix(const char *base);
 static void zero_bytes(void *dst, size_t len);
 static int call_security_read_policy(void **data, size_t *len);
 static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state);
@@ -773,6 +772,8 @@ static bool clean_policydb_redirect_supported(void)
 
 static bool current_is_policy_manager(void)
 {
+    if (current_uid() >= 10000)
+        return false;
     const char *comm = current_comm();
 
     if (str_eq_lit(comm, "magiskpolicy") ||
@@ -845,138 +846,6 @@ static void append_u32_dec(char *buf, size_t size, u32 value)
     while (i && pos < size - 1)
         buf[pos++] = tmp[--i];
     buf[pos] = '\0';
-}
-
-struct suffix_lookup {
-    const char *base;
-    unsigned long addr;
-};
-
-typedef int (*kallsyms_on_each_symbol_nomod_fn)(int (*fn)(void *, const char *, unsigned long),
-                                                void *data);
-
-static bool suffix_contains_cfi(const char *suffix)
-{
-    size_t i;
-
-    if (!suffix)
-        return false;
-
-    for (i = 0; suffix[i]; i++) {
-        if (suffix[i] == 'c' && suffix[i + 1] == 'f' && suffix[i + 2] == 'i' &&
-            (i == 0 || suffix[i - 1] == '.' || suffix[i - 1] == '$') &&
-            (!suffix[i + 3] || suffix[i + 3] == '.' || suffix[i + 3] == '$'))
-            return true;
-    }
-    return false;
-}
-
-static bool symbol_has_compiler_suffix(const char *name, const char *base)
-{
-    size_t i;
-
-    if (!name || !base)
-        return false;
-
-    for (i = 0; base[i]; i++) {
-        if (name[i] != base[i])
-            return false;
-    }
-
-    if (!(name[i] == '.' || name[i] == '$') || !name[i + 1])
-        return false;
-
-    /* Skip CFI stub variants; they redirect to the real function */
-    if (suffix_contains_cfi(name + i + 1))
-        return false;
-
-    return true;
-}
-
-static int lookup_name_with_suffix_cb(void *data, const char *name,
-                                      struct module *module, unsigned long addr)
-{
-    struct suffix_lookup *lookup = data;
-
-    (void)module;
-    if (!lookup || lookup->addr || !addr)
-        return 0;
-
-    if (!symbol_has_compiler_suffix(name, lookup->base))
-        return 0;
-
-    lookup->addr = addr;
-    selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                     lookup->base, name, addr);
-    return 1;
-}
-
-static int lookup_name_with_suffix_cb_nomod(void *data, const char *name,
-                                            unsigned long addr)
-{
-    struct suffix_lookup *lookup = data;
-
-    if (!lookup || lookup->addr || !addr)
-        return 0;
-
-    if (!symbol_has_compiler_suffix(name, lookup->base))
-        return 0;
-
-    lookup->addr = addr;
-    selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                     lookup->base, name, addr);
-    return 1;
-}
-
-static unsigned long lookup_suffix_by_symbol_walk(const char *base)
-{
-    struct suffix_lookup lookup;
-
-    if (!kallsyms_on_each_symbol)
-        return 0;
-
-    lookup.base = base;
-    lookup.addr = 0;
-
-    if (kver <= VERSION(6, 1, 0)) {
-        kallsyms_on_each_symbol(lookup_name_with_suffix_cb, &lookup);
-    } else {
-        kallsyms_on_each_symbol_nomod_fn on_each_symbol;
-
-        on_each_symbol = (kallsyms_on_each_symbol_nomod_fn)kallsyms_on_each_symbol;
-        on_each_symbol(lookup_name_with_suffix_cb_nomod, &lookup);
-    }
-
-    return lookup.addr;
-}
-
-static unsigned long lookup_name_with_suffix(const char *base)
-{
-    char name[96];
-    size_t i;
-    u32 n;
-    unsigned long addr;
-
-    if (!base)
-        return 0;
-
-    for (n = 0; n < 256; n++) {
-        for (i = 0; i < sizeof(name) - 1 && base[i]; i++)
-            name[i] = base[i];
-        if (i >= sizeof(name) - 2)
-            return 0;
-        name[i++] = '.';
-        name[i] = '\0';
-        append_u32_dec(name, sizeof(name), n);
-        addr = (unsigned long)kallsyms_lookup_name(name);
-        if (addr) {
-            selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                             base, name, addr);
-            return addr;
-        }
-    }
-
-    return lookup_suffix_by_symbol_walk(base);
 }
 
 static int call_security_read_policy(void **data, size_t *len)
@@ -2472,13 +2341,9 @@ static int install_write_op_hooks(void)
     int rc;
 
     /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
-    addr_access = (unsigned long)kallsyms_lookup_name("sel_write_access");
-    if (!addr_access)
-        addr_access = lookup_name_with_suffix("sel_write_access");
+    addr_access = kallsyms_lookup_name_by_suffix("sel_write_access");
 
-    addr_context = (unsigned long)kallsyms_lookup_name("sel_write_context");
-    if (!addr_context)
-        addr_context = lookup_name_with_suffix("sel_write_context");
+    addr_context = kallsyms_lookup_name_by_suffix("sel_write_context");
 
     if (addr_access) {
         g_funcs[g_hooks++] = (void *)addr_access;
@@ -3148,13 +3013,13 @@ static long init(const char *args, const char *event, void *__user r)
     avtab_search_node_next_fn = (void *)kallsyms_lookup_name("avtab_search_node_next");
     cond_compute_av_fn = (void *)kallsyms_lookup_name("cond_compute_av");
     if (!cond_compute_av_fn && kver >= VERSION(5, 10, 0))
-        cond_compute_av_fn = (void *)lookup_name_with_suffix("cond_compute_av");
+        cond_compute_av_fn = (void *)kallsyms_lookup_name_by_suffix("cond_compute_av");
     constraint_expr_eval_fn = (void *)kallsyms_lookup_name("constraint_expr_eval");
     if (!constraint_expr_eval_fn && kver >= VERSION(5, 10, 0))
-        constraint_expr_eval_fn = (void *)lookup_name_with_suffix("constraint_expr_eval");
+        constraint_expr_eval_fn = (void *)kallsyms_lookup_name_by_suffix("constraint_expr_eval");
     type_attribute_bounds_av_fn = (void *)kallsyms_lookup_name("type_attribute_bounds_av");
     if (!type_attribute_bounds_av_fn && kver >= VERSION(5, 10, 0))
-        type_attribute_bounds_av_fn = (void *)lookup_name_with_suffix("type_attribute_bounds_av");
+        type_attribute_bounds_av_fn = (void *)kallsyms_lookup_name_by_suffix("type_attribute_bounds_av");
     selinux_policy_cancel_fn = (void *)kallsyms_lookup_name("selinux_policy_cancel");
     selinux_policy_cancel_compat_fn = (void *)selinux_policy_cancel_fn;
     sidtab_cancel_convert_fn = (void *)kallsyms_lookup_name("sidtab_cancel_convert");
@@ -3204,9 +3069,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find simple_read_from_buffer, status hook will use direct user copy fallback\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("sel_read_handle_status");
-    if (!addr)
-        addr = lookup_name_with_suffix("sel_read_handle_status");
+    addr = kallsyms_lookup_name_by_suffix("sel_read_handle_status");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4\n");
@@ -3217,9 +3080,7 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     /* Hook the mmap handler — Android libselinux uses mmap() not read() */
-    addr = (unsigned long)kallsyms_lookup_name("sel_mmap_handle_status");
-    if (!addr)
-        addr = lookup_name_with_suffix("sel_mmap_handle_status");
+    addr = kallsyms_lookup_name_by_suffix("sel_mmap_handle_status");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
@@ -3231,7 +3092,7 @@ static long init(const char *args, const char *event, void *__user r)
     /* Freeze status page sequence/policyload on old kernels */
     addr = (unsigned long)kallsyms_lookup_name("selinux_status_update_seqlock");
     if (!addr && kver >= VERSION(5, 10, 0))
-        addr = lookup_name_with_suffix("selinux_status_update_seqlock");
+        addr = kallsyms_lookup_name_by_suffix("selinux_status_update_seqlock");
     if (addr) {
         /* argc=1 on < 5.19 (state arg), argc=0 on >= 5.19 */
         int argc = (kver < VERSION(5, 19, 0)) ? 1 : 0;
@@ -3244,7 +3105,7 @@ static long init(const char *args, const char *event, void *__user r)
 
     addr = (unsigned long)kallsyms_lookup_name("selinux_status_update_policyload");
     if (!addr && kver >= VERSION(5, 10, 0))
-        addr = lookup_name_with_suffix("selinux_status_update_policyload");
+        addr = kallsyms_lookup_name_by_suffix("selinux_status_update_policyload");
     if (addr) {
         /* argc=2 on < 5.19 (state, seqno), argc=1 on >= 5.19 (seqno) */
         int argc = (kver < VERSION(5, 19, 0)) ? 2 : 1;
@@ -3276,9 +3137,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find security_setprocattr\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("selinux_setprocattr");
-    if (!addr)
-        addr = lookup_name_with_suffix("selinux_setprocattr");
+    addr = kallsyms_lookup_name_by_suffix("selinux_setprocattr");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3\n");
@@ -3293,9 +3152,7 @@ static long init(const char *args, const char *event, void *__user r)
         return rc;
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("context_struct_compute_av");
-    if (!addr)
-        addr = lookup_name_with_suffix("context_struct_compute_av");
+    addr = kallsyms_lookup_name_by_suffix("context_struct_compute_av");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         if (clean_policydb_redirect_supported()) {
