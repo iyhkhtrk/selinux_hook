@@ -1228,8 +1228,7 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
      * input.  The scope is tied to current so unrelated callers on other tasks
      * remain observational and keep using the live policydb.
      */
-    if (clean_policydb_redirect_supported() &&
-        current_in_clean_eval_scope() && clean_policydb && !bypass) {
+    if (current_in_clean_eval_scope() && clean_policydb) {
         a->arg0 = (uint64_t)clean_policydb;
         return;
     }
@@ -1315,11 +1314,11 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     a->local.data2 = 0;
 
     uid = current_uid();
-    copy_query_sample(sample, query, size);
 
     if (should_bypass_clean_filter(uid))
         return;
 
+    copy_query_sample(sample, query, size);
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
@@ -1354,11 +1353,11 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     a->local.data2 = 0;
 
     uid = current_uid();
-    copy_query_sample(sample, query, size);
 
     if (should_bypass_clean_filter(uid))
         return;
 
+    copy_query_sample(sample, query, size);
     n = READ_ONCE(g_clean_access_count) + 1;
     WRITE_ONCE(g_clean_access_count, n);
 
@@ -1597,7 +1596,7 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
         n++;
         WRITE_ONCE(g_selinux_setprocattr_probe_count, n);
         pr_info("[selinux_hook] PROBE selinux_setprocattr #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
+                n, uid, current_comm(), (void *)a->arg0,
                 (void *)a->arg1, (size_t)a->arg2);
     }
 
