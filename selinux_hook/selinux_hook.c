@@ -40,7 +40,6 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define MAGISK_POLICY_PATH "/.magisk/selinux/load"
 #define MAGISK_POLICY_REL_PATH ".magisk/selinux/load"
 #define MAGISK_POLICY_MAX_SIZE (8 * 1024 * 1024)
-#define CLEAN_EVAL_SCOPE_SLOTS 8
 #define SELINUX_STATUS_SIZE 20
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
@@ -93,7 +92,6 @@ static size_t g_clean_policy_len;
 static bool g_clean_policy_has_magisk;
 static bool g_clean_policydb_direct;
 static void *g_clean_policydb;
-static u32 g_clean_eval_depth;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_policy_capture_in_progress;
 
@@ -110,25 +108,12 @@ struct clean_eval_scope {
 };
 
 static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
-static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
+static struct clean_eval_scope g_clean_eval_scope = { NULL, 0 };
 static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
 static void *g_status_mmap_page;
 static uintptr_t g_status_fp_slots[2];
 static void *g_status_fp_orig[2];
 static int g_status_fp_hooks;
-
-/* Spinlock guards for the scope arrays.  We do not use DEFINE_SPINLOCK +
- * spin_lock() because the running kernel on this device does not export
- * _raw_spin_lock/_raw_spin_unlock through the kfunc ksymtab; the wrapper
- * expands to kf__raw_spin_lock/unknown.  Resolve the raw helpers via
- * kallsyms at init (mirroring vmalloc/vfree/etc.) and call them through
- * a function pointer, matching the convention used elsewhere in this
- * module. */
-typedef void (*raw_spin_lock_fn_t)(raw_spinlock_t *lock);
-typedef void (*raw_spin_unlock_fn_t)(raw_spinlock_t *lock);
-static raw_spin_lock_fn_t g_raw_spin_lock_fn;
-static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
-static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
 
 static bool contains_magisk(const char *s, size_t len);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
@@ -144,8 +129,6 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage, 
 static void before_security_load_policy(hook_fargs4_t *a, void *u);
 static void after_security_load_policy(hook_fargs4_t *a, void *u);
 static void try_load_clean_policydb_from_blob(const char *reason);
-static void before_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
-static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
@@ -751,98 +734,45 @@ static size_t copy_query_sample(char *dst, const char *src, size_t size)
     return sanitize_query_sample(dst, (size_t)copied);
 }
 
-static bool enter_clean_eval_scope(void)
-{
+static bool enter_clean_eval_scope(void) {
     void *task = current;
-    int empty = -1;
-    int i;
-    u32 depth;
-    bool entered = false;
 
     if (!clean_policydb_redirect_supported())
         return false;
     if (!READ_ONCE(g_clean_policydb))
         return false;
 
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < CLEAN_EVAL_SCOPE_SLOTS; i++) {
-        if (g_clean_eval_scopes[i].task == task) {
-            depth = g_clean_eval_scopes[i].depth + 1;
-            g_clean_eval_scopes[i].depth = depth;
-            WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) + 1);
-            entered = true;
-            break;
-        }
-        if (empty < 0 && !g_clean_eval_scopes[i].task)
-            empty = i;
+    /*
+     * Task-keyed and synchronous: only the task that entered the scope is
+     * redirected.  The slot is advisory -- if another task holds it we just
+     * fall back to the live policy, so no atomicity is required.
+     */
+    if (g_clean_eval_scope.task == task) {
+        g_clean_eval_scope.depth++;
+    } else if (!g_clean_eval_scope.task) {
+        g_clean_eval_scope.task = task;
+        g_clean_eval_scope.depth = 1;
+    } else {
+        return false;
     }
-
-    if (!entered) {
-        if (empty < 0) {
-            if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-            pr_warn("[selinux_hook] clean eval scope slots exhausted task=%px comm=%s\n",
-                    task, current_comm());
-            return false;
-        }
-        g_clean_eval_scopes[empty].task = task;
-        g_clean_eval_scopes[empty].depth = 1;
-        WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) + 1);
-        entered = true;
-    }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
     return true;
 }
-
-static void leave_clean_eval_scope(void)
-{
+ 
+static void leave_clean_eval_scope(void) {
     void *task = current;
-    int i;
-    u32 depth;
-
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < CLEAN_EVAL_SCOPE_SLOTS; i++) {
-        if (g_clean_eval_scopes[i].task != task)
-            continue;
-
-        depth = g_clean_eval_scopes[i].depth;
-        if (depth > 1) {
-            g_clean_eval_scopes[i].depth = depth - 1;
+    if (g_clean_eval_scope.task == task) {
+        if (g_clean_eval_scope.depth > 1) {
+            g_clean_eval_scope.depth--;
         } else {
-            g_clean_eval_scopes[i].depth = 0;
-            g_clean_eval_scopes[i].task = NULL;
+            g_clean_eval_scope.depth = 0;
+            g_clean_eval_scope.task = NULL;
         }
-        if (READ_ONCE(g_clean_eval_depth))
-            WRITE_ONCE(g_clean_eval_depth, READ_ONCE(g_clean_eval_depth) - 1);
-        if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-        return;
     }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
 }
 
-static bool current_in_clean_eval_scope(void)
-{
+static bool current_in_clean_eval_scope(void) {
     void *task = current;
-    int i;
-    bool in_scope = false;
-
-    if (g_raw_spin_lock_fn)
-        g_raw_spin_lock_fn(&g_scopes_lock);
-    for (i = 0; i < CLEAN_EVAL_SCOPE_SLOTS; i++) {
-        if (g_clean_eval_scopes[i].task == task &&
-            g_clean_eval_scopes[i].depth) {
-            in_scope = true;
-            break;
-        }
-    }
-    if (g_raw_spin_unlock_fn)
-        g_raw_spin_unlock_fn(&g_scopes_lock);
-    return in_scope;
+    return g_clean_eval_scope.task == task && g_clean_eval_scope.depth;
 }
 
 /* Hook: selinux_complete_init */
@@ -909,44 +839,6 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     }
 }
 
-static void before_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
-{
-    struct av_decision *avd;
-    void *clean_policydb;
-
-    a->local.data0 = 0;
-
-    before_policydb_arg0(a, u);
-
-    clean_policydb = READ_ONCE(g_clean_policydb);
-    if (!clean_policydb || (void *)a->arg0 != clean_policydb ||
-        !current_in_clean_eval_scope())
-        return;
-
-    avd = (struct av_decision *)a->arg4;
-    if (!avd)
-        return;
-
-    a->local.data0 = 1;
-    a->local.data1 = (uint64_t)avd;
-    a->local.data2 = READ_ONCE(avd->seqno);
-    a->local.data3 = READ_ONCE(avd->flags);
-}
-
-static void after_context_struct_compute_av_policydb(hook_fargs6_t *a, void *u)
-{
-    struct av_decision *avd;
-
-    if (a->local.data0) {
-        avd = (struct av_decision *)a->local.data1;
-        if (avd) {
-            WRITE_ONCE(avd->seqno, SELINUX_STATUS_CLEAN_SEQUENCE);
-            WRITE_ONCE(avd->flags, (u32)a->local.data3);
-        }
-    }
-
-}
-
 /* Hook: /sys/fs/selinux/access write handler */
 static void before_sel_write_access(hook_fargs4_t *a, void *u)
 {
@@ -962,8 +854,6 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     uid_t uid;
 
     a->local.data0 = 0;
-    a->local.data1 = 0;
-    a->local.data2 = 0;
 
     uid = current_uid();
 
@@ -1001,8 +891,6 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     uid_t uid;
 
     a->local.data0 = 0;
-    a->local.data1 = 0;
-    a->local.data2 = 0;
 
     uid = current_uid();
 
@@ -1035,12 +923,10 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
     struct access_probe *probe;
     u32 id;
     u32 slot;
-    u32 mode;
 
     if (!a->local.data0)
         return;
 
-    mode = (u32)a->local.data0;
     id = (u32)a->local.data1;
     slot = (u32)a->local.data2;
     if (a->local.data3)
@@ -1062,17 +948,10 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
         }
     }
 
-    if (mode == 2)
-        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
+    selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
                          probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
                          READ_ONCE(g_clean_policydb), READ_ONCE(g_clean_policy_blob),
                          READ_ONCE(g_clean_policy_len), probe->query);
-    else
-        selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/%s #%u uid=%d comm=%s clean_ret=%ld clean_policydb=%px blob=%px len=%zu query=\"%s\"\n",
-                     probe->node ?: "?", id, probe->uid, current_comm(), live_ret,
-                     READ_ONCE(g_clean_policydb), READ_ONCE(g_clean_policy_blob),
-                     READ_ONCE(g_clean_policy_len),
-                     probe->query);
 }
 
 static int install_write_op_hooks(void)
@@ -1444,17 +1323,6 @@ static long init(const char *args, const char *event, void *__user r)
     pr_info("[selinux_hook] kernel kver=%x legacy_blob_abi=%d\n",
             kver, use_legacy_clean_blob_query() ? 1 : 0);
 
-    /* Raw spinlock helpers — kfunc wrappers are not exported on this kernel,
-     * so resolve through kallsyms and call via function pointer.  The locks
-     * become no-ops if resolution fails, which is acceptable for these
-     * scope arrays (they only see per-task scope entry/exit pairs that
-     * are also serialized against themselves). */
-    g_raw_spin_lock_fn = (raw_spin_lock_fn_t)kallsyms_lookup_name_by_suffix("_raw_spin_lock");
-    g_raw_spin_unlock_fn = (raw_spin_unlock_fn_t)kallsyms_lookup_name_by_suffix("_raw_spin_unlock");
-    if (!g_raw_spin_lock_fn || !g_raw_spin_unlock_fn)
-        pr_warn("[selinux_hook] raw_spin_lock/unlock unresolved: lock=%px unlock=%px; scope/cache lock will be a no-op\n",
-                g_raw_spin_lock_fn, g_raw_spin_unlock_fn);
-
     copy_from_kernel_nofault_fn = (void *)kallsyms_lookup_name_by_suffix("copy_from_kernel_nofault");
     if (!copy_from_kernel_nofault_fn)
         copy_from_kernel_nofault_fn = (void *)kallsyms_lookup_name_by_suffix("probe_kernel_read");
@@ -1538,12 +1406,9 @@ static long init(const char *args, const char *event, void *__user r)
     /* Policydb redirect hooks / policydb 重定向 hooks. */
 	addr = (unsigned long)kallsyms_lookup_name_by_suffix("context_struct_compute_av");
     if (addr && clean_policydb_redirect_supported()) {
-        record_inline_hook((void *)addr,
-                           before_context_struct_compute_av_policydb,
-                           after_context_struct_compute_av_policydb);
+        record_inline_hook((void *)addr, before_policydb_arg0, NULL);
         pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
-        hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
-                  after_context_struct_compute_av_policydb, NULL);
+        hook_wrap((void *)addr, 6, before_policydb_arg0, NULL, NULL);
     } else if (!addr) {
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
     } else {
