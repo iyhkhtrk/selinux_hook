@@ -94,6 +94,8 @@ static bool g_clean_policydb_direct;
 static void *g_clean_policydb;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_policy_capture_in_progress;
+static struct page *(*vmalloc_to_page_fn)(const void *addr);
+static struct page *g_clean_status_page;
 
 struct access_probe {
     u32 id;
@@ -1173,6 +1175,59 @@ static bool remap_clean_status_page(struct vm_area_struct *vma)
     return remap_vmalloc_range_fn(vma, g_status_mmap_page, 0) == 0;
 }
 
+static int g_file_private_data_offset = -1;
+
+/* 解析 sel_read_handle_status 前几条指令，获取 private_data 的真实偏移 */
+static int resolve_file_private_data_offset(void *func_addr)
+{
+    const u32 *insn = (const u32 *)func_addr;
+    int reg_base = 0; /* X0 寄存器编号 */
+    int i;
+
+    if (!func_addr)
+        return -1;
+
+    /* 扫描前 16 条指令 (64 字节) */
+    for (i = 0; i < 16; i++) {
+        u32 code = insn[i];
+
+        /*
+         * 兼容情况 1：mov Xd, X0 (实际编码为 orr Xd, xzr, X0)
+         * 如果编译器先将参数 x0 保存到 callee-saved 寄存器（如 x19）
+         */
+        if ((code & 0xffe0ffe0) == 0xaa0003e0) {
+            reg_base = (int)(code & 0x1f);
+            continue;
+        }
+
+        /*
+         * 核心匹配：ldr Xt, [X(reg_base), #pimm] (64-bit unsigned offset)
+         * 机器码特征：
+         * bits[31:22] == 0b1111100101 (0xf9400000)
+         * bits[9:5]   == reg_base
+         */
+        if ((code & 0xffc00000) == 0xf9400000) {
+            int rn = (code >> 5) & 0x1f;
+            if (rn == reg_base) {
+                int imm12 = (code >> 10) & 0xfff;
+                int offset = imm12 << 3; /* 64-bit 访问，左移 3 位 */
+                pr_info("[selinux_hook] Disassembled private_data offset = 0x%x (%d)\n",
+                        offset, offset);
+                return offset;
+            }
+        }
+    }
+
+    return -1;
+}
+
+static inline void **file_private_data_ptr(struct file *file)
+{
+    if (g_file_private_data_offset < 0 || !file)
+        return NULL;
+    return (void **)((char *)file + g_file_private_data_offset);
+}
+
 static ssize_t sel_read_handle_status_fp_hook(struct file *file,
                                               char __user *buffer,
                                               size_t count, loff_t *ppos)
@@ -1188,24 +1243,28 @@ static ssize_t sel_read_handle_status_fp_hook(struct file *file,
 static int sel_mmap_handle_status_fp_hook(struct file *file,
                                           struct vm_area_struct *vma)
 {
-    if (should_bypass_clean_filter(current_uid())) {
-        if (sel_mmap_status_fp_orig_fn)
-            return sel_mmap_status_fp_orig_fn(file, vma);
+    void **ppriv;
+    void *orig_page;
+    int ret;
+
+    if (!sel_mmap_status_fp_orig_fn)
         return -ENOSYS;
-    }
 
-    if (!g_status_mmap_page || !remap_vmalloc_range_fn) {
-        if (sel_mmap_status_fp_orig_fn)
-            return sel_mmap_status_fp_orig_fn(file, vma);
-        return -ENOSYS;
-    }
-
-    if (!remap_vmalloc_range_fn(vma, g_status_mmap_page, 0))
-        return 0;
-
-    if (sel_mmap_status_fp_orig_fn)
+    ppriv = file_private_data_ptr(file);
+    if (should_bypass_clean_filter(current_uid()) || !g_clean_status_page || !ppriv)
         return sel_mmap_status_fp_orig_fn(file, vma);
-    return -ENOSYS;
+
+    /* 替换为干净页 */
+    orig_page = *ppriv;
+    *ppriv = g_clean_status_page;
+
+    /* 调用原函数：由内核原生处理随机化结构体、完成参数检查和映射 */
+    ret = sel_mmap_status_fp_orig_fn(file, vma);
+
+    /* 还原 */
+    *ppriv = orig_page;
+
+    return ret;
 }
 
 static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
@@ -1219,11 +1278,37 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
 
 static void before_sel_mmap_handle_status(hook_fargs4_t *a, void *u)
 {
-    if (!should_bypass_clean_filter(current_uid()) &&
-        remap_clean_status_page((struct vm_area_struct *)a->arg1)) {
-        a->ret = 0;
-        a->skip_origin = 1;
-    }
+    a->local.data0 = 0;
+    a->local.data1 = 0;
+
+    if (should_bypass_clean_filter(current_uid()))
+        return;
+    struct file *file = (struct file *)a->arg0;
+    void **ppriv = file_private_data_ptr(file);
+
+    if (!g_clean_status_page || !ppriv)
+        return;
+
+    /* 1. 暂存真实的 status page 指针 */
+    a->local.data1 = (uint64_t)*ppriv;
+    a->local.data0 = 1;
+
+    /* 2. 偷换为干净的 page 指针 */
+    *ppriv = (void *)g_clean_status_page;
+
+    /* 3. 放行原生函数：让原生内核自己执行所有针对 vma 的检查和映射！ */
+}
+
+static void after_sel_mmap_handle_status(hook_fargs4_t *a, void *u)
+{
+    struct file *file = (struct file *)a->arg0;
+    void **ppriv = file_private_data_ptr(file);
+
+    /* 4. 恢复原真实指针 */
+    if (a->local.data0 && ppriv)
+        *ppriv = (void *)a->local.data1;
+
+    /* 原生函数的返回值（成功 0，或拒绝时的 -EIO / -EPERM）会被完整保留传递 */
 }
 
 static bool install_status_hooks(void)
@@ -1241,6 +1326,14 @@ static bool install_status_hooks(void)
     read_addr = (unsigned long)kallsyms_lookup_name_by_suffix("sel_read_handle_status");
     mmap_addr = (unsigned long)kallsyms_lookup_name_by_suffix("sel_mmap_handle_status");
     status_ops = (unsigned long)kallsyms_lookup_name_by_suffix("sel_handle_status_ops");
+    vmalloc_to_page_fn = (void *)kallsyms_lookup_name_by_suffix("vmalloc_to_page");
+
+    if (read_addr) {
+        g_file_private_data_offset = resolve_file_private_data_offset((void *)read_addr);
+        if (g_file_private_data_offset < 0) {
+            pr_warn("[selinux_hook] Failed to resolve private_data offset via disassembly\n");
+        }
+    }
 
     if (read_addr) {
         err = hook_wrap((void *)read_addr, 4, before_sel_read_handle_status, NULL, NULL);
@@ -1277,10 +1370,14 @@ static bool install_status_hooks(void)
         }
     }
 
+    if (g_status_mmap_page && vmalloc_to_page_fn) {
+        g_clean_status_page = vmalloc_to_page_fn(g_status_mmap_page);
+    }
+
     if (mmap_addr && g_status_mmap_page && remap_vmalloc_range_fn) {
-        err = hook_wrap((void *)mmap_addr, 2, before_sel_mmap_handle_status, NULL, NULL);
+        err = hook_wrap((void *)mmap_addr, 2, before_sel_mmap_handle_status, after_sel_mmap_handle_status, NULL);
         if (err == HOOK_NO_ERR) {
-            record_inline_hook((void *)mmap_addr, before_sel_mmap_handle_status, NULL);
+            record_inline_hook((void *)mmap_addr, before_sel_mmap_handle_status, after_sel_mmap_handle_status);
             pr_info("[selinux_hook] status mmap inline hook installed @%px fake_page=%px size=%zu\n",
                     (void *)mmap_addr, g_status_mmap_page, page_size);
             installed = true;
