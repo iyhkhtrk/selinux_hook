@@ -44,6 +44,8 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
 #define KP_AVD_CLEAN_SEQNO 1
+#define VM_WRITE 0x00000002
+#define VM_MAYWRITE 0x00000020
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
 
 typedef enum {
@@ -94,6 +96,7 @@ static bool g_clean_policydb_direct;
 static void *g_clean_policydb;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_policy_capture_in_progress;
+static size_t g_page_size;
 
 struct access_probe {
     u32 id;
@@ -1165,12 +1168,21 @@ static ssize_t read_clean_status_bytes(char __user *buffer, size_t count,
     return (ssize_t)count;
 }
 
-static bool remap_clean_status_page(struct vm_area_struct *vma)
+static int remap_clean_status_page(struct vm_area_struct *vma)
 {
-    if (!g_status_mmap_page || !remap_vmalloc_range_fn)
-        return false;
+    if (kver < VERSION(4, 15, 0)) {
+        unsigned long vm_start = *(unsigned long *)((char *)vma + 0);
+        unsigned long vm_end = *(unsigned long *)((char *)vma + 8);
+        unsigned long vm_flags = *(unsigned long *)((char *)vma + 80);
+        unsigned long vm_pgoff = *(unsigned long *)((char *)vma + 152);
 
-    return remap_vmalloc_range_fn(vma, g_status_mmap_page, 0) == 0;
+        if (vm_pgoff > 0 || (vm_end - vm_start) != g_page_size)
+            return -EIO;
+        if (vm_flags & VM_WRITE)
+            return -EPERM;
+        *(unsigned long *)((char *)vma + 80) = vm_flags & ~VM_MAYWRITE;
+    }
+    return remap_vmalloc_range_fn(vma, g_status_mmap_page, 0);
 }
 
 static ssize_t sel_read_handle_status_fp_hook(struct file *file,
@@ -1219,11 +1231,11 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
 
 static void before_sel_mmap_handle_status(hook_fargs4_t *a, void *u)
 {
-    if (!should_bypass_clean_filter(current_uid()) &&
-        remap_clean_status_page((struct vm_area_struct *)a->arg1)) {
-        a->ret = 0;
-        a->skip_origin = 1;
-    }
+    if (should_bypass_clean_filter(current_uid()) || !g_status_mmap_page || !remap_vmalloc_range_fn)
+        return;
+
+    a->ret = remap_clean_status_page((struct vm_area_struct *)a->arg1);
+    a->skip_origin = 1;
 }
 
 static bool install_status_hooks(void)
@@ -1233,7 +1245,6 @@ static bool install_status_hooks(void)
     unsigned long status_ops;
     uintptr_t slot;
     hook_err_t err;
-    size_t page_size = runtime_page_size();
     bool installed = false;
     bool read_installed = false;
     bool mmap_installed = false;
@@ -1269,9 +1280,9 @@ static bool install_status_hooks(void)
 
     remap_vmalloc_range_fn = (void *)kallsyms_lookup_name_by_suffix("remap_vmalloc_range");
     if (remap_vmalloc_range_fn && vmalloc_user_fn && !g_status_mmap_page) {
-        g_status_mmap_page = vmalloc_user_fn(page_size);
+        g_status_mmap_page = vmalloc_user_fn(g_page_size);
         if (g_status_mmap_page) {
-            zero_bytes(g_status_mmap_page, page_size);
+            zero_bytes(g_status_mmap_page, g_page_size);
             copy_bytes(g_status_mmap_page, g_clean_status_bytes,
                        sizeof(g_clean_status_bytes));
         }
@@ -1282,7 +1293,7 @@ static bool install_status_hooks(void)
         if (err == HOOK_NO_ERR) {
             record_inline_hook((void *)mmap_addr, before_sel_mmap_handle_status, NULL);
             pr_info("[selinux_hook] status mmap inline hook installed @%px fake_page=%px size=%zu\n",
-                    (void *)mmap_addr, g_status_mmap_page, page_size);
+                    (void *)mmap_addr, g_status_mmap_page, g_page_size);
             installed = true;
             mmap_installed = true;
         }
@@ -1311,6 +1322,8 @@ static long init(const char *args, const char *event, void *__user r)
 {
     unsigned long addr;
     int rc;
+
+    g_page_size = runtime_page_size();
 
     selinux_hook_dbg("[selinux_hook] init event=%s\n", event ?: "(null)");
 
