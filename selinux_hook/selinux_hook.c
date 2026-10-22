@@ -94,7 +94,6 @@ static size_t g_clean_policy_len;
 static bool g_clean_policy_has_magisk;
 static bool g_clean_policydb_direct;
 static void *g_clean_policydb;
-static u32 g_selinux_setprocattr_probe_count;
 static bool g_policy_capture_in_progress;
 static size_t g_page_size;
 
@@ -1119,18 +1118,8 @@ static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 {
     const char *name = (const char *)a->arg0;
     uid_t uid = current_uid();
-    u32 n;
 
     a->local.data0 = 0;
-
-    n = READ_ONCE(g_selinux_setprocattr_probe_count);
-    if (n < 16) {
-        n++;
-        WRITE_ONCE(g_selinux_setprocattr_probe_count, n);
-        pr_info("[selinux_hook] PROBE selinux_setprocattr #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
-                n, uid, current_comm(), (void *)a->arg0,
-                (void *)a->arg1, (size_t)a->arg2);
-    }
 
     if (should_bypass_clean_filter(uid) || !str_eq_lit(name, "current"))
         return;
