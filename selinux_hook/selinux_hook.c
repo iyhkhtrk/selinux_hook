@@ -46,7 +46,15 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 #define KP_AVD_CLEAN_SEQNO 1
 #define VM_WRITE 0x00000002
 #define VM_MAYWRITE 0x00000020
+#ifdef SELINUX_HOOK_VERBOSE
 #define selinux_hook_dbg(fmt, ...) pr_info(fmt, ##__VA_ARGS__)
+#else
+#define selinux_hook_dbg(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+#endif
+int no_printk(const char *fmt, ...)
+{
+    return 0;
+}
 
 typedef enum {
     SEL_HOOK_STATE_NORMAL = 0,
@@ -798,14 +806,6 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
 {
     void *policydb = (void *)a->arg0;
     void *clean_policydb = READ_ONCE(g_clean_policydb);
-    bool bypass = should_bypass_clean_filter(current_uid());
-
-    if (!clean_policydb_redirect_supported())
-        return;
-
-    if (bypass)
-        return;
-    
     
     /*
      * Only calls running in an explicit clean-eval scope may redirect policydb
