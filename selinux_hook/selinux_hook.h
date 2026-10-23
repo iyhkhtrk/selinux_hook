@@ -17,7 +17,7 @@
 
 #define lookup_name(func)                                  \
     func = 0;                                              \
-    func = (typeof(func))kallsyms_lookup_name(#func);      \
+    func = (typeof(func))kallsyms_lookup_name_by_suffix(#func);      \
     pr_info("kernel function %s addr: %llx\n", #func, func); \
     if (!func) {                                           \
         return -21;                                        \
